@@ -27,6 +27,7 @@ namespace Apache.Ignite.Core.Impl.Datastream
     using Apache.Ignite.Core.Impl.Binary.IO;
     using Apache.Ignite.Core.Impl.Cache;
     using Apache.Ignite.Core.Impl.Common;
+    using Apache.Ignite.Core.Impl.Deployment;
 
     /// <summary>
     /// Binary wrapper for <see cref="IStreamReceiver{TK,TV}"/>.
@@ -80,7 +81,6 @@ namespace Apache.Ignite.Core.Impl.Datastream
         {
             Debug.Assert(rcv != null);
             Debug.Assert(invoke != null);
-
             _rcv = rcv;
             _invoke = invoke;
         }
@@ -89,6 +89,7 @@ namespace Apache.Ignite.Core.Impl.Datastream
         public void WriteBinary(IBinaryWriter writer)
         {
             var w = writer.GetRawWriter();
+            
 
             var writeAware = _rcv as IBinaryWriteAware;
 
@@ -97,7 +98,12 @@ namespace Apache.Ignite.Core.Impl.Datastream
             else
             {
                 w.WriteByte(RcvNormal);
-                w.WriteObject(_rcv);
+                //++
+                w.WriteObject(new PeerLoadingObjectHolder(_rcv));
+                //++
+                //--
+                //w.WriteObject(_rcv);
+                //--
             }
         }
 
