@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-#if !NETCOREAPP2_0 && !NETCOREAPP2_1
+#if !NETCOREAPP2_0 && !NETCOREAPP2_1  && !NETCOREAPP2_2
 namespace Apache.Ignite.Core.Impl.Unmanaged.Jni
 {
     using System;
