@@ -29,9 +29,11 @@ import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import org.apache.ignite.IgniteCheckedException;
+import org.apache.ignite.IgniteException;
 import org.apache.ignite.IgniteLogger;
 import org.apache.ignite.IgniteSystemProperties;
 import org.apache.ignite.cache.query.annotations.QuerySqlFunction;
@@ -53,12 +55,16 @@ import org.apache.ignite.internal.processors.query.h2.sys.view.SqlSystemViewBase
 import org.apache.ignite.internal.processors.query.h2.sys.view.SqlSystemViewCacheGroups;
 import org.apache.ignite.internal.processors.query.h2.sys.view.SqlSystemViewCacheGroupsIOStatistics;
 import org.apache.ignite.internal.processors.query.h2.sys.view.SqlSystemViewCaches;
+import org.apache.ignite.internal.processors.query.h2.sys.view.SqlSystemViewIndexes;
 import org.apache.ignite.internal.processors.query.h2.sys.view.SqlSystemViewNodeAttributes;
 import org.apache.ignite.internal.processors.query.h2.sys.view.SqlSystemViewNodeMetrics;
 import org.apache.ignite.internal.processors.query.h2.sys.view.SqlSystemViewNodes;
+import org.apache.ignite.internal.processors.query.h2.sys.view.SqlSystemViewQueryHistoryMetrics;
 import org.apache.ignite.internal.processors.query.h2.sys.view.SqlSystemViewRunningQueries;
+import org.apache.ignite.internal.processors.query.h2.sys.view.SqlSystemViewSchemas;
 import org.apache.ignite.internal.processors.query.h2.sys.view.SqlSystemViewTables;
 import org.apache.ignite.internal.processors.query.schema.SchemaIndexCacheVisitor;
+import org.apache.ignite.internal.util.GridConcurrentHashSet;
 import org.apache.ignite.internal.util.typedef.F;
 import org.apache.ignite.internal.util.typedef.internal.U;
 import org.h2.index.Index;
@@ -79,6 +85,9 @@ public class SchemaManager {
 
     /** Data tables. */
     private final ConcurrentMap<QueryTable, GridH2Table> dataTables = new ConcurrentHashMap<>();
+
+    /** System VIEW collection. */
+    private final Set<SqlSystemView> systemViews = new GridConcurrentHashSet<>();
 
     /** Mutex to synchronize schema operations. */
     private final Object schemaMux = new Object();
@@ -127,31 +136,44 @@ public class SchemaManager {
     }
 
     /**
-     * Create system views.
+     * Registers new system view.
+     *
+     * @param schema Schema to create view in.
+     * @param view System view.
      */
-    private void createSystemViews() throws IgniteCheckedException {
+    public void createSystemView(String schema, SqlSystemView view) {
+
         boolean disabled = IgniteSystemProperties.getBoolean(IgniteSystemProperties.IGNITE_SQL_DISABLE_SYSTEM_VIEWS);
 
         if (disabled) {
             log.info("SQL system views will not be created because they are disabled (see " +
-                    IgniteSystemProperties.IGNITE_SQL_DISABLE_SYSTEM_VIEWS + " system property)");
+                IgniteSystemProperties.IGNITE_SQL_DISABLE_SYSTEM_VIEWS + " system property)");
 
             return;
         }
 
         try {
             synchronized (schemaMux) {
-                createSchema0(QueryUtils.SCHEMA_SYS);
+                createSchema(schema, true);
             }
 
-            try (Connection c = connMgr.connectionNoCache(QueryUtils.SCHEMA_SYS)) {
-                for (SqlSystemView view : systemViews(ctx))
-                    SqlSystemTableEngine.registerView(c, view);
+            try (Connection c = connMgr.connectionNoCache(schema)) {
+                SqlSystemTableEngine.registerView(c, view);
+
+                    systemViews.add(view);
             }
         }
-        catch (SQLException e) {
-            throw new IgniteCheckedException("Failed to register system view.", e);
+        catch (IgniteCheckedException | SQLException e) {
+            throw new IgniteException("Failed to register system view.", e);
         }
+    }
+
+    /**
+     * Create system views.
+     */
+    private void createSystemViews() throws IgniteCheckedException {
+        for (SqlSystemView view : systemViews(ctx))
+            createSystemView(QueryUtils.SCHEMA_SYS, view);
     }
 
     /**
@@ -169,7 +191,10 @@ public class SchemaManager {
         views.add(new SqlSystemViewCacheGroups(ctx));
         views.add(new SqlSystemViewCacheGroupsIOStatistics(ctx));
         views.add(new SqlSystemViewRunningQueries(ctx));
-        views.add(new SqlSystemViewTables(ctx, this));
+        views.add(new SqlSystemViewQueryHistoryMetrics(ctx));
+        views.add(new SqlSystemViewTables(ctx));
+        views.add(new SqlSystemViewIndexes(ctx, this));
+        views.add(new SqlSystemViewSchemas(ctx, this));
 
         return views;
     }
@@ -414,6 +439,15 @@ public class SchemaManager {
     }
 
     /**
+     * Get schemas names.
+     *
+     * @return Schemas names.
+     */
+    public Set<String> schemaNames(){
+        return new HashSet<>(schemas.keySet());
+    }
+
+    /**
      * Get schema by name.
      *
      * @param schemaName Schema name.
@@ -588,6 +622,12 @@ public class SchemaManager {
         throws IgniteCheckedException{
         String sql = H2Utils.indexDropSql(schemaName, idxName, ifExists);
 
+        GridH2Table tbl = dataTableForIndex(schemaName, idxName);
+
+        assert tbl != null;
+
+        tbl.setRemoveIndexOnDestroy(true);
+
         connMgr.executeStatement(schemaName, sql);
     }
 
@@ -702,6 +742,13 @@ public class SchemaManager {
      */
     public Collection<GridH2Table> dataTables() {
         return dataTables.values();
+    }
+
+    /**
+     * @return all known system views.
+     */
+    public Collection<SqlSystemView> systemViews() {
+        return Collections.unmodifiableSet(systemViews);
     }
 
     /**

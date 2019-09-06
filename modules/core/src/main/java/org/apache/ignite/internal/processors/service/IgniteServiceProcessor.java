@@ -52,6 +52,7 @@ import org.apache.ignite.internal.IgniteClientDisconnectedCheckedException;
 import org.apache.ignite.internal.IgniteInternalFuture;
 import org.apache.ignite.internal.IgniteInterruptedCheckedException;
 import org.apache.ignite.internal.SkipDaemon;
+import org.apache.ignite.internal.managers.deployment.GridDeployment;
 import org.apache.ignite.internal.managers.discovery.CustomEventListener;
 import org.apache.ignite.internal.managers.discovery.DiscoCache;
 import org.apache.ignite.internal.processors.affinity.AffinityTopologyVersion;
@@ -60,6 +61,10 @@ import org.apache.ignite.internal.processors.cache.DynamicCacheChangeRequest;
 import org.apache.ignite.internal.processors.cluster.ChangeGlobalStateMessage;
 import org.apache.ignite.internal.processors.cluster.DiscoveryDataClusterState;
 import org.apache.ignite.internal.processors.cluster.IgniteChangeGlobalStateSupport;
+import org.apache.ignite.internal.processors.metric.GridMetricManager;
+import org.apache.ignite.spi.metric.ReadOnlyMonitoringListRegistry;
+import org.apache.ignite.spi.metric.list.MonitoringList;
+import org.apache.ignite.spi.metric.list.view.ServiceView;
 import org.apache.ignite.internal.util.future.GridCompoundFuture;
 import org.apache.ignite.internal.util.future.GridFinishedFuture;
 import org.apache.ignite.internal.util.future.GridFutureAdapter;
@@ -89,6 +94,8 @@ import static org.apache.ignite.configuration.DeploymentMode.ISOLATED;
 import static org.apache.ignite.configuration.DeploymentMode.PRIVATE;
 import static org.apache.ignite.events.EventType.EVT_NODE_JOINED;
 import static org.apache.ignite.internal.GridComponent.DiscoveryDataExchangeType.SERVICE_PROC;
+import static org.apache.ignite.internal.processors.metric.GridMetricManager.SVCS_MON_LIST;
+import static org.apache.ignite.internal.processors.metric.GridMetricManager.SVCS_MON_LIST_DESC;
 
 /**
  * Ignite service processor.
@@ -122,6 +129,14 @@ public class IgniteServiceProcessor extends ServiceProcessorAdapter implements I
      * @see ServiceDeploymentManager
      */
     private final ConcurrentMap<IgniteUuid, ServiceInfo> registeredServices = new ConcurrentHashMap<>();
+
+    /**
+     * Services monitoring list.
+     *
+     * @see ReadOnlyMonitoringListRegistry
+     * @see GridMetricManager
+     */
+    private final MonitoringList<IgniteUuid, ServiceView> svcsMonList;
 
     /**
      * Collection of services information that were processed by deployment worker. <b>It is updated from deployment
@@ -184,6 +199,8 @@ public class IgniteServiceProcessor extends ServiceProcessorAdapter implements I
      */
     public IgniteServiceProcessor(GridKernalContext ctx) {
         super(ctx);
+
+        svcsMonList = ctx.metric().list(SVCS_MON_LIST, SVCS_MON_LIST_DESC, ServiceView.class);
     }
 
     /** {@inheritDoc} */
@@ -263,6 +280,7 @@ public class IgniteServiceProcessor extends ServiceProcessorAdapter implements I
         cancelDeployedServices();
 
         registeredServices.clear();
+        svcsMonList.clear();
 
         // If user requests sent to network but not received back to handle in deployment manager.
         Stream.concat(depFuts.values().stream(), undepFuts.values().stream()).forEach(fut -> {
@@ -332,8 +350,10 @@ public class IgniteServiceProcessor extends ServiceProcessorAdapter implements I
 
         ServiceProcessorCommonDiscoveryData clusterData = (ServiceProcessorCommonDiscoveryData)data.commonData();
 
-        for (ServiceInfo desc : clusterData.registeredServices())
+        for (ServiceInfo desc : clusterData.registeredServices()) {
             registeredServices.put(desc.serviceId(), desc);
+            svcsMonList.add(desc);
+        }
     }
 
     /** {@inheritDoc} */
@@ -367,6 +387,7 @@ public class IgniteServiceProcessor extends ServiceProcessorAdapter implements I
 
             if (oldDesc == null) {
                 registeredServices.put(desc.serviceId(), desc);
+                svcsMonList.add(desc);
 
                 continue;
             }
@@ -603,7 +624,7 @@ public class IgniteServiceProcessor extends ServiceProcessorAdapter implements I
      */
     private SecurityException checkPermissions(String name, SecurityPermission perm) {
         try {
-            ctx.security().authorize(name, perm, null);
+            ctx.security().authorize(name, perm);
 
             return null;
         }
@@ -857,7 +878,7 @@ public class IgniteServiceProcessor extends ServiceProcessorAdapter implements I
             return null;
 
         try {
-            ctx.security().authorize(name, SecurityPermission.SERVICE_INVOKE, null);
+            ctx.security().authorize(name, SecurityPermission.SERVICE_INVOKE);
 
             Collection<ServiceContextImpl> ctxs = serviceContexts(name);
 
@@ -928,7 +949,7 @@ public class IgniteServiceProcessor extends ServiceProcessorAdapter implements I
     @Override public <T> T serviceProxy(ClusterGroup prj, String name, Class<? super T> srvcCls, boolean sticky,
         long timeout)
         throws IgniteException {
-        ctx.security().authorize(name, SecurityPermission.SERVICE_INVOKE, null);
+        ctx.security().authorize(name, SecurityPermission.SERVICE_INVOKE);
 
         if (hasLocalNode(prj)) {
             ServiceContextImpl ctx = serviceContext(name);
@@ -968,7 +989,7 @@ public class IgniteServiceProcessor extends ServiceProcessorAdapter implements I
             return null;
 
         try {
-            ctx.security().authorize(name, SecurityPermission.SERVICE_INVOKE, null);
+            ctx.security().authorize(name, SecurityPermission.SERVICE_INVOKE);
 
             Collection<ServiceContextImpl> ctxs = serviceContexts(name);
 
@@ -1239,9 +1260,14 @@ public class IgniteServiceProcessor extends ServiceProcessorAdapter implements I
      */
     private Service copyAndInject(ServiceConfiguration cfg) throws IgniteCheckedException {
         if (cfg instanceof LazyServiceConfiguration) {
+            LazyServiceConfiguration srvcCfg = (LazyServiceConfiguration)cfg;
+
+            GridDeployment srvcDep = ctx.deploy().getDeployment(srvcCfg.serviceClassName());
+
             byte[] bytes = ((LazyServiceConfiguration)cfg).serviceBytes();
 
-            Service srvc = U.unmarshal(marsh, bytes, U.resolveClassLoader(null, ctx.config()));
+            Service srvc = U.unmarshal(marsh, bytes,
+                U.resolveClassLoader(srvcDep != null ? srvcDep.classLoader() : null, ctx.config()));
 
             ctx.resource().inject(srvc);
 
@@ -1489,7 +1515,10 @@ public class IgniteServiceProcessor extends ServiceProcessorAdapter implements I
             // First node start, method onGridDataReceived(DiscoveryDataBag.GridDiscoveryData) has not been called.
             ArrayList<ServiceInfo> staticServicesInfo = staticallyConfiguredServices(false);
 
-            staticServicesInfo.forEach(desc -> registeredServices.put(desc.serviceId(), desc));
+            staticServicesInfo.forEach(desc -> {
+                registeredServices.put(desc.serviceId(), desc);
+                svcsMonList.add(desc);
+            });
         }
 
         ServiceDeploymentActions depActions = null;
@@ -1592,6 +1621,7 @@ public class IgniteServiceProcessor extends ServiceProcessorAdapter implements I
                             ServiceInfo desc = new ServiceInfo(snd.id(), reqSrvcId, cfg);
 
                             registeredServices.put(reqSrvcId, desc);
+                            svcsMonList.add(desc);
 
                             toDeploy.put(reqSrvcId, desc);
                         }
@@ -1625,6 +1655,7 @@ public class IgniteServiceProcessor extends ServiceProcessorAdapter implements I
             }
             else if (req instanceof ServiceUndeploymentRequest) {
                 ServiceInfo rmv = registeredServices.remove(reqSrvcId);
+                svcsMonList.remove(reqSrvcId);
 
                 assert oldDesc == rmv : "Concurrent map modification.";
 
@@ -1675,6 +1706,8 @@ public class IgniteServiceProcessor extends ServiceProcessorAdapter implements I
 
                     if (desc.cacheName().equals(chReq.cacheName())) {
                         toUndeploy.put(desc.serviceId(), desc);
+
+                        svcsMonList.remove(desc.serviceId());
 
                         return true;
                     }
